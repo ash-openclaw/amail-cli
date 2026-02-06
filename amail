@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""
+Ash Email Tool - Custom OpenClaw email client for Hydroxide/Proton Bridge
+Usage: ash-email <command> [options]
+
+Commands:
+  status          Check bridge status
+  auth            Authenticate with Proton (interactive)
+  list            List unread emails
+  read            Read specific email by ID
+  send            Send email
+  reply           Reply to email by ID
+  mark-read       Mark email(s) as read
+  search          Search emails by subject/from
+"""
+
+import argparse
+import imaplib
+import smtplib
+import email
+import os
+import sys
+import json
+import subprocess
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from pathlib import Path
+
+# Config paths
+CONFIG_DIR = Path.home() / ".config" / "ash-email"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+ENV_FILE = Path("/data/workspace/.env.email")
+
+# Default settings
+DEFAULT_IMAP_HOST = "127.0.0.1"
+DEFAULT_IMAP_PORT = 1143
+DEFAULT_SMTP_HOST = "127.0.0.1" 
+DEFAULT_SMTP_PORT = 1025
+
+def get_config():
+    """Load config from file or env"""
+    config = {
+        "user": "ash-autonomous@proton.me",
+        "imap_host": DEFAULT_IMAP_HOST,
+        "imap_port": DEFAULT_IMAP_PORT,
+        "smtp_host": DEFAULT_SMTP_HOST,
+        "smtp_port": DEFAULT_SMTP_PORT,
+        "password": None
+    }
+    
+    # Try config file
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                config.update(json.load(f))
+        except:
+            pass
+    
+    # Try env file
+    if ENV_FILE.exists():
+        try:
+            with open(ENV_FILE) as f:
+                for line in f:
+                    if line.startswith("IMAP_PASSWORD="):
+                        config["password"] = line.strip().split("=", 1)[1]
+                    elif line.startswith("PROTON_BRIDGE_USER="):
+                        config["user"] = line.strip().split("=", 1)[1]
+        except:
+            pass
+    
+    return config
+
+def save_config(config):
+    """Save config to file"""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+
+def get_imap_connection():
+    """Get authenticated IMAP connection"""
+    config = get_config()
+    if not config.get("password"):
+        print("Error: No password configured. Run 'ash-email auth' first.", file=sys.stderr)
+        sys.exit(1)
+    
+    mail = imaplib.IMAP4(config["imap_host"], config["imap_port"])
+    mail.login(config["user"], config["password"])
+    return mail
+
+def get_smtp_connection():
+    """Get authenticated SMTP connection"""
+    config = get_config()
+    if not config.get("password"):
+        print("Error: No password configured. Run 'ash-email auth' first.", file=sys.stderr)
+        sys.exit(1)
+    
+    server = smtplib.SMTP(config["smtp_host"], config["smtp_port"])
+    server.login(config["user"], config["password"])
+    return server
+
+def cmd_status(args):
+    """Check bridge status"""
+    try:
+        result = subprocess.run(
+            [str(Path.home() / "go" / "bin" / "hydroxide"), "status"],
+            capture_output=True, text=True, timeout=5
+        )
+        print(result.stdout)
+        if result.returncode != 0:
+            print("Error:", result.stderr, file=sys.stderr)
+            return 1
+    except FileNotFoundError:
+        print("Error: hydroxide not found. Is it installed?", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+def cmd_auth(args):
+    """Interactive auth instructions"""
+    print("""
+To authenticate with Proton Bridge, run these OpenClaw commands:
+
+1. Start auth with PTY:
+   exec({
+     command: "hydroxide auth your-email@proton.me",
+     pty: true
+   })
+
+2. When prompted for password, send it:
+   process({
+     action: "write",
+     sessionId: "<session-id-from-step-1>",
+     data: "your-bridge-password\\n"
+   })
+
+3. Copy the bridge password output and update .env.email:
+   IMAP_PASSWORD=<new-bridge-password>
+   SMTP_PASSWORD=<new-bridge-password>
+
+Note: Use your Proton Mail bridge password, not your login password.
+""")
+    return 0
+
+def cmd_list(args):
+    """List unread emails"""
+    try:
+        mail = get_imap_connection()
+        mail.select('inbox')
+        
+        typ, data = mail.search(None, 'UNSEEN')
+        unread_ids = data[0].split()
+        
+        if not unread_ids:
+            print("No unread emails.")
+            mail.close()
+            mail.logout()
+            return 0
+        
+        print(f"Unread: {len(unread_ids)}\n")
+        
+        for num in unread_ids[:args.limit]:
+            typ, msg_data = mail.fetch(num, '(BODY[HEADER.FIELDS (FROM SUBJECT DATE)])')
+            for response_part in msg_data:
+                if isinstance(response_part, tuple):
+                    msg = email.message_from_bytes(response_part[1])
+                    print(f"{num.decode()}: {msg['from'][:40]:40} | {msg['subject'][:50]}")
+        
+        mail.close()
+        mail.logout()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+def cmd_read(args):
+    """Read specific email"""
+    try:
+        mail = get_imap_connection()
+        mail.select('inbox')
+        
+        typ, msg_data = mail.fetch(str(args.id), '(RFC822)')
+        for response_part in msg_data:
+            if isinstance(response_part, tuple):
+                msg = email.message_from_bytes(response_part[1])
+                
+                print(f"From: {msg['from']}")
+                print(f"To: {msg['to']}")
+                print(f"Subject: {msg['subject']}")
+                print(f"Date: {msg['date']}")
+                print("-" * 50)
+                
+                # Get body
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == 'text/plain':
+                            try:
+                                body = part.get_payload(decode=True).decode('utf-8', errors='replace')
+                                break
+                            except:
+                                pass
+                else:
+                    try:
+                        body = msg.get_payload(decode=True).decode('utf-8', errors='replace')
+                    except:
+                        pass
+                
+                print(body)
+        
+        mail.close()
+        mail.logout()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+def cmd_send(args):
+    """Send email"""
+    try:
+        server = get_smtp_connection()
+        
+        msg = MIMEMultipart()
+        msg['From'] = get_config()["user"]
+        msg['To'] = args.to
+        msg['Subject'] = args.subject
+        
+        # Read body from file or argument
+        if args.body_file:
+            with open(args.body_file) as f:
+                body = f.read()
+        else:
+            body = args.body or ""
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        server.sendmail(get_config()["user"], args.to, msg.as_string())
+        server.quit()
+        
+        print(f"✅ Email sent to {args.to}")
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+def cmd_reply(args):
+    """Reply to email by ID"""
+    try:
+        # Get original email
+        mail = get_imap_connection()
+        mail.select('inbox')
+        
+        typ, msg_data = mail.fetch(str(args.id), '(RFC822)')
+        original = None
+        for response_part in msg_data:
+            if isinstance(response_part, tuple):
+                original = email.message_from_bytes(response_part[1])
+                break
+        
+        if not original:
+            print(f"Error: Email {args.id} not found", file=sys.stderr)
+            return 1
+        
+        # Build reply
+        server = get_smtp_connection()
+        
+        msg = MIMEMultipart()
+        msg['From'] = get_config()["user"]
+        msg['To'] = original['from']
+        msg['Subject'] = f"Re: {original['subject']}"
+        
+        body = args.body or ""
+        msg.attach(MIMEText(body, 'plain'))
+        
+        server.sendmail(get_config()["user"], original['from'], msg.as_string())
+        server.quit()
+        
+        print(f"✅ Reply sent to {original['from']}")
+        
+        # Mark as read if requested
+        if args.mark_read:
+            mail.store(str(args.id), '+FLAGS', '\\Seen')
+            print(f"✅ Marked email {args.id} as read")
+        
+        mail.close()
+        mail.logout()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+def cmd_mark_read(args):
+    """Mark email(s) as read"""
+    try:
+        mail = get_imap_connection()
+        mail.select('inbox')
+        
+        for email_id in args.ids:
+            mail.store(str(email_id), '+FLAGS', '\\Seen')
+            print(f"✅ Marked email {email_id} as read")
+        
+        mail.close()
+        mail.logout()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+def cmd_search(args):
+    """Search emails"""
+    try:
+        mail = get_imap_connection()
+        mail.select('inbox')
+        
+        # Search by subject or from
+        if args.subject:
+            typ, data = mail.search(None, f'SUBJECT "{args.subject}"')
+        elif args.from_addr:
+            typ, data = mail.search(None, f'FROM "{args.from_addr}"')
+        else:
+            print("Error: Use --subject or --from", file=sys.stderr)
+            return 1
+        
+        ids = data[0].split()
+        print(f"Found {len(ids)} emails\n")
+        
+        for num in ids[:args.limit]:
+            typ, msg_data = mail.fetch(num, '(BODY[HEADER.FIELDS (FROM SUBJECT DATE)])')
+            for response_part in msg_data:
+                if isinstance(response_part, tuple):
+                    msg = email.message_from_bytes(response_part[1])
+                    print(f"{num.decode()}: {msg['from'][:40]:40} | {msg['subject'][:50]}")
+        
+        mail.close()
+        mail.logout()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Ash Email Tool - Proton Mail CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  ash-email status
+  ash-email list
+  ash-email read --id 123
+  ash-email send --to user@example.com --subject "Hello" --body "Message"
+  ash-email reply --id 123 --body "Thanks!" --mark-read
+  ash-email mark-read --ids 123 124 125
+        """
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+    
+    # status
+    subparsers.add_parser('status', help='Check bridge status')
+    
+    # auth
+    subparsers.add_parser('auth', help='Show auth instructions')
+    
+    # list
+    list_parser = subparsers.add_parser('list', help='List unread emails')
+    list_parser.add_argument('--limit', '-l', type=int, default=50, help='Max emails to show')
+    
+    # read
+    read_parser = subparsers.add_parser('read', help='Read email by ID')
+    read_parser.add_argument('--id', '-i', type=int, required=True, help='Email ID')
+    
+    # send
+    send_parser = subparsers.add_parser('send', help='Send email')
+    send_parser.add_argument('--to', '-t', required=True, help='Recipient')
+    send_parser.add_argument('--subject', '-s', required=True, help='Subject')
+    send_parser.add_argument('--body', '-b', help='Body text')
+    send_parser.add_argument('--body-file', '-f', help='Read body from file')
+    
+    # reply
+    reply_parser = subparsers.add_parser('reply', help='Reply to email')
+    reply_parser.add_argument('--id', '-i', type=int, required=True, help='Email ID to reply to')
+    reply_parser.add_argument('--body', '-b', required=True, help='Reply body')
+    reply_parser.add_argument('--mark-read', '-m', action='store_true', help='Mark original as read')
+    
+    # mark-read
+    mark_parser = subparsers.add_parser('mark-read', help='Mark emails as read')
+    mark_parser.add_argument('--ids', '-i', nargs='+', type=int, required=True, help='Email IDs')
+    
+    # search
+    search_parser = subparsers.add_parser('search', help='Search emails')
+    search_parser.add_argument('--subject', help='Search by subject')
+    search_parser.add_argument('--from', dest='from_addr', help='Search by sender')
+    search_parser.add_argument('--limit', '-l', type=int, default=20, help='Max results')
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return 1
+    
+    commands = {
+        'status': cmd_status,
+        'auth': cmd_auth,
+        'list': cmd_list,
+        'read': cmd_read,
+        'send': cmd_send,
+        'reply': cmd_reply,
+        'mark-read': cmd_mark_read,
+        'search': cmd_search,
+    }
+    
+    return commands[args.command](args)
+
+if __name__ == '__main__':
+    sys.exit(main())
