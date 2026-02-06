@@ -191,23 +191,49 @@ def cmd_read(args):
                 print(f"Date: {msg['date']}")
                 print("-" * 50)
                 
-                # Get body
+                # Get body - try plain text first, then HTML
                 body = ""
+                html_body = ""
+                
                 if msg.is_multipart():
                     for part in msg.walk():
-                        if part.get_content_type() == 'text/plain':
+                        content_type = part.get_content_type()
+                        if content_type == 'text/plain':
                             try:
                                 body = part.get_payload(decode=True).decode('utf-8', errors='replace')
-                                break
+                            except:
+                                pass
+                        elif content_type == 'text/html':
+                            try:
+                                html_body = part.get_payload(decode=True).decode('utf-8', errors='replace')
                             except:
                                 pass
                 else:
                     try:
-                        body = msg.get_payload(decode=True).decode('utf-8', errors='replace')
+                        content = msg.get_payload(decode=True).decode('utf-8', errors='replace')
+                        if msg.get_content_type() == 'text/html':
+                            html_body = content
+                        else:
+                            body = content
                     except:
                         pass
                 
-                print(body)
+                # Prefer plain text, but show HTML if that's all we have
+                if body.strip():
+                    print(body)
+                elif html_body.strip():
+                    # Simple HTML tag stripping for readability
+                    import re
+                    text = re.sub(r'<[^>]+>', '', html_body)
+                    text = re.sub(r'&nbsp;', ' ', text)
+                    text = re.sub(r'&quot;', '"', text)
+                    text = re.sub(r'&amp;', '&', text)
+                    text = re.sub(r'&lt;', '<', text)
+                    text = re.sub(r'&gt;', '>', text)
+                    text = re.sub(r'\n\s*\n', '\n\n', text)
+                    print(text.strip())
+                else:
+                    print("(No content)")
         
         mail.close()
         mail.logout()
