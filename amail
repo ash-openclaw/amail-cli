@@ -7,11 +7,24 @@ Commands:
   status          Check bridge status
   auth            Authenticate with Proton (interactive)
   list            List unread emails
-  read            Read specific email by ID
-  send            Send email
+  read            Read specific email by ID (with attachment download support)
+  send            Send email (with optional attachments, PGP support)
   reply           Reply to email by ID
   mark-read       Mark email(s) as read
   search          Search emails by subject/from
+
+Send with Attachments:
+  amail send -t user@example.com -s "Subject" -a file.png
+  amail send -t user@example.com -s "Subject" -a file.png --pgp-sign
+  amail send -t user@example.com -s "Subject" -a file.pdf --pgp-encrypt
+
+Read with Attachments:
+  amail read -i 123                    # List attachments only
+  amail read -i 123 --save-attachments # Download to ~/Downloads/amail/
+  amail read -i 123 --save-attachments /path/to/dir  # Custom directory
+
+Note: PGP signing/encryption requires GPG keys to be configured:
+  gpg --gen-key  # Generate a keypair for your email
 """
 
 import argparse
@@ -22,9 +35,72 @@ import os
 import sys
 import json
 import subprocess
+import time
+import tempfile
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
+from email.mime.base import MIMEBase
+from email import encoders
 from pathlib import Path
+import mimetypes
+
+# PGP/GPG support for Proton Mail E2E attachments
+def pgp_sign_attachment(filepath, signer_email):
+    """Sign attachment with PGP for Proton Mail E2E compatibility"""
+    try:
+        # Check if gpg is available
+        result = subprocess.run(['gpg', '--version'], capture_output=True, timeout=5)
+        if result.returncode != 0:
+            return None
+        
+        # Create detached signature
+        sig_path = str(filepath) + '.sig'
+        result = subprocess.run(
+            ['gpg', '--detach-sign', '--armor', '-o', sig_path, str(filepath)],
+            capture_output=True,
+            timeout=30
+        )
+        
+        if result.returncode == 0 and os.path.exists(sig_path):
+            return sig_path
+        return None
+    except Exception as e:
+        return None
+
+def pgp_encrypt_attachment(filepath, recipient_email):
+    """Encrypt attachment with PGP for Proton Mail"""
+    try:
+        enc_path = str(filepath) + '.pgp'
+        result = subprocess.run(
+            ['gpg', '--encrypt', '--armor', '-r', recipient_email, '-o', enc_path, str(filepath)],
+            capture_output=True,
+            timeout=30
+        )
+        if result.returncode == 0 and os.path.exists(enc_path):
+            return enc_path
+        return None
+    except Exception as e:
+        return None
+
+# Tool Tracker integration
+TOOL_TRACKER_JS = "/data/workspace/tools/tool-tracker/tool-tracker.js"
+
+def log_tool_call(tool, args, outcome):
+    """Log tool call to tool-tracker"""
+    try:
+        record = json.dumps({
+            "tool": tool,
+            "args": args,
+            "outcome": outcome
+        })
+        subprocess.run(
+            ["node", TOOL_TRACKER_JS, "log", record],
+            capture_output=True,
+            timeout=5
+        )
+    except:
+        pass  # Silent fail - don't break email functionality
 
 # Config paths
 CONFIG_DIR = Path.home() / ".config" / "ash-email"
@@ -145,6 +221,7 @@ Note: Use your Proton Mail bridge password, not your login password.
 
 def cmd_list(args):
     """List unread emails"""
+    start_time = time.time()
     try:
         mail = get_imap_connection()
         mail.select('inbox')
@@ -156,6 +233,11 @@ def cmd_list(args):
             print("No unread emails.")
             mail.close()
             mail.logout()
+            log_tool_call("amail_list", {"limit": args.limit}, {
+                "success": True,
+                "duration_ms": int((time.time() - start_time) * 1000),
+                "unread_count": 0
+            })
             return 0
         
         print(f"Unread: {len(unread_ids)}\n")
@@ -169,7 +251,17 @@ def cmd_list(args):
         
         mail.close()
         mail.logout()
+        log_tool_call("amail_list", {"limit": args.limit}, {
+            "success": True,
+            "duration_ms": int((time.time() - start_time) * 1000),
+            "unread_count": len(unread_ids)
+        })
     except Exception as e:
+        log_tool_call("amail_list", {"limit": args.limit}, {
+            "success": False,
+            "duration_ms": int((time.time() - start_time) * 1000),
+            "error": str(e)
+        })
         print(f"Error: {e}", file=sys.stderr)
         return 1
     return 0
@@ -191,14 +283,22 @@ def cmd_read(args):
                 print(f"Date: {msg['date']}")
                 print("-" * 50)
                 
-                # Get body - try plain text first, then HTML
+                # Get body and attachments
                 body = ""
                 html_body = ""
+                attachments = []
                 
                 if msg.is_multipart():
                     for part in msg.walk():
                         content_type = part.get_content_type()
-                        if content_type == 'text/plain':
+                        content_disposition = str(part.get('Content-Disposition', ''))
+                        
+                        # Check if this is an attachment
+                        if 'attachment' in content_disposition:
+                            filename = part.get_filename()
+                            if filename:
+                                attachments.append((filename, part))
+                        elif content_type == 'text/plain':
                             try:
                                 body = part.get_payload(decode=True).decode('utf-8', errors='replace')
                             except:
@@ -218,7 +318,7 @@ def cmd_read(args):
                     except:
                         pass
                 
-                # Prefer plain text, but show HTML if that's all we have
+                # Show body content
                 if body.strip():
                     print(body)
                 elif html_body.strip():
@@ -234,6 +334,42 @@ def cmd_read(args):
                     print(text.strip())
                 else:
                     print("(No content)")
+                
+                # Handle attachments
+                if attachments:
+                    print("\n" + "-" * 50)
+                    print(f"📎 Attachments ({len(attachments)}):")
+                    
+                    # Determine download directory
+                    download_dir = Path(args.save_attachments) if args.save_attachments else Path.home() / "Downloads" / "amail"
+                    
+                    for i, (filename, part) in enumerate(attachments, 1):
+                        print(f"  {i}. {filename}")
+                        
+                        if args.save_attachments is not None:
+                            # Save attachment
+                            download_dir.mkdir(parents=True, exist_ok=True)
+                            filepath = download_dir / filename
+                            
+                            # Handle duplicate filenames
+                            counter = 1
+                            original_filepath = filepath
+                            while filepath.exists():
+                                stem = original_filepath.stem
+                                suffix = original_filepath.suffix
+                                filepath = download_dir / f"{stem}_{counter}{suffix}"
+                                counter += 1
+                            
+                            try:
+                                payload = part.get_payload(decode=True)
+                                with open(filepath, 'wb') as f:
+                                    f.write(payload)
+                                print(f"     💾 Saved to: {filepath}")
+                            except Exception as e:
+                                print(f"     ❌ Error saving: {e}")
+                    
+                    if args.save_attachments is None:
+                        print(f"\n💡 Use --save-attachments to download to: {download_dir}")
         
         mail.close()
         mail.logout()
@@ -261,6 +397,83 @@ def cmd_send(args):
         
         msg.attach(MIMEText(body, 'plain'))
         
+        # Attach files if provided
+        # Note: Proton Mail via Hydroxide requires E2E signed attachments
+        if args.attach:
+            for filepath in args.attach:
+                filepath = Path(filepath)
+                if not filepath.exists():
+                    print(f"⚠️ Attachment not found: {filepath}", file=sys.stderr)
+                    continue
+                
+                # For Proton Mail, try to PGP sign/encrypt attachments
+                if args.pgp_sign:
+                    sig_path = pgp_sign_attachment(filepath, get_config()["user"])
+                    if sig_path:
+                        # Attach both file and signature
+                        with open(filepath, 'rb') as f:
+                            file_data = f.read()
+                        content_type, _ = mimetypes.guess_type(str(filepath))
+                        if content_type is None:
+                            content_type = 'application/octet-stream'
+                        main_type, sub_type = content_type.split('/', 1)
+                        
+                        if main_type == 'image':
+                            attachment = MIMEImage(file_data, _subtype=sub_type)
+                        else:
+                            attachment = MIMEBase(main_type, sub_type)
+                            attachment.set_payload(file_data)
+                            encoders.encode_base64(attachment)
+                        
+                        attachment.add_header('Content-Disposition', f'attachment; filename="{filepath.name}"')
+                        msg.attach(attachment)
+                        
+                        # Attach signature
+                        with open(sig_path, 'rb') as f:
+                            sig_data = f.read()
+                        sig_attachment = MIMEBase('application', 'pgp-signature')
+                        sig_attachment.set_payload(sig_data)
+                        sig_attachment.add_header('Content-Disposition', f'attachment; filename="{filepath.name}.asc"')
+                        msg.attach(sig_attachment)
+                        
+                        os.remove(sig_path)  # Clean up temp signature
+                        print(f"📎 Attached (PGP signed): {filepath.name}")
+                        continue
+                
+                if args.pgp_encrypt:
+                    enc_path = pgp_encrypt_attachment(filepath, args.to)
+                    if enc_path:
+                        with open(enc_path, 'rb') as f:
+                            enc_data = f.read()
+                        enc_attachment = MIMEBase('application', 'pgp-encrypted')
+                        enc_attachment.set_payload(enc_data)
+                        enc_attachment.add_header('Content-Disposition', f'attachment; filename="{filepath.name}.pgp"')
+                        msg.attach(enc_attachment)
+                        os.remove(enc_path)
+                        print(f"📎 Attached (PGP encrypted): {filepath.name}")
+                        continue
+                
+                # Standard attachment (no PGP)
+                content_type, encoding = mimetypes.guess_type(str(filepath))
+                if content_type is None or encoding is not None:
+                    content_type = 'application/octet-stream'
+                
+                main_type, sub_type = content_type.split('/', 1)
+                
+                with open(filepath, 'rb') as f:
+                    file_data = f.read()
+                
+                if main_type == 'image':
+                    attachment = MIMEImage(file_data, _subtype=sub_type)
+                else:
+                    attachment = MIMEBase(main_type, sub_type)
+                    attachment.set_payload(file_data)
+                    encoders.encode_base64(attachment)
+                
+                attachment.add_header('Content-Disposition', f'attachment; filename="{filepath.name}"')
+                msg.attach(attachment)
+                print(f"📎 Attached: {filepath.name}")
+        
         server.sendmail(get_config()["user"], args.to, msg.as_string())
         server.quit()
         
@@ -272,6 +485,7 @@ def cmd_send(args):
 
 def cmd_reply(args):
     """Reply to email by ID"""
+    start_time = time.time()
     try:
         # Get original email
         mail = get_imap_connection()
@@ -286,6 +500,11 @@ def cmd_reply(args):
         
         if not original:
             print(f"Error: Email {args.id} not found", file=sys.stderr)
+            log_tool_call("amail_reply", {"id": args.id, "mark_read": args.mark_read}, {
+                "success": False,
+                "duration_ms": int((time.time() - start_time) * 1000),
+                "error": "Email not found"
+            })
             return 1
         
         # Build reply
@@ -311,7 +530,16 @@ def cmd_reply(args):
         
         mail.close()
         mail.logout()
+        log_tool_call("amail_reply", {"id": args.id, "mark_read": args.mark_read}, {
+            "success": True,
+            "duration_ms": int((time.time() - start_time) * 1000)
+        })
     except Exception as e:
+        log_tool_call("amail_reply", {"id": args.id, "mark_read": args.mark_read}, {
+            "success": False,
+            "duration_ms": int((time.time() - start_time) * 1000),
+            "error": str(e)
+        })
         print(f"Error: {e}", file=sys.stderr)
         return 1
     return 0
@@ -395,6 +623,7 @@ Examples:
     # read
     read_parser = subparsers.add_parser('read', help='Read email by ID')
     read_parser.add_argument('--id', '-i', type=int, required=True, help='Email ID')
+    read_parser.add_argument('--save-attachments', nargs='?', const='', metavar='DIR', help='Save attachments to directory (default: ~/Downloads/amail)')
     
     # send
     send_parser = subparsers.add_parser('send', help='Send email')
@@ -402,6 +631,9 @@ Examples:
     send_parser.add_argument('--subject', '-s', required=True, help='Subject')
     send_parser.add_argument('--body', '-b', help='Body text')
     send_parser.add_argument('--body-file', '-f', help='Read body from file')
+    send_parser.add_argument('--attach', '-a', nargs='+', help='Attach file(s) to email')
+    send_parser.add_argument('--pgp-sign', action='store_true', help='PGP sign attachments (for Proton Mail)')
+    send_parser.add_argument('--pgp-encrypt', action='store_true', help='PGP encrypt attachments')
     
     # reply
     reply_parser = subparsers.add_parser('reply', help='Reply to email')
